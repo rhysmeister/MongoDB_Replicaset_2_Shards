@@ -1,4 +1,22 @@
 Vagrant.configure("2") do |config|
+  MONGOS_HOSTS=1
+  (1..MONGOS_HOSTS).each do |mongos|
+    node_name = "mongos-node#{mongod}"
+    config.vm.define node_name do |mongos_node|
+      mongod_node.vm.box = "centos/7"
+      mongod_node.vm.network "private_network", ip: "192.168.43.#{100 + mongod}"
+      mongod_node.vm.hostname = node_name
+      mongod_node.vm.provider :virtualbox do |vbox|
+        vbox.linked_clone = true
+        vbox.name = node_name
+      end
+      if mongos == MONGOS_HOSTS
+        mongod_node.vm.provision :ansible do |ansible|
+        ansible.limit = "all" # Connect to all machines
+        ansible.playbook = "mongos.yaml"
+      end
+    end
+  end
   MONGOD_HOSTS=6
   (1..MONGOD_HOSTS).each do |mongod|
     node_name = "mongod-node#{mongod}"
