@@ -1,0 +1,215 @@
+---
+# tasks file for MongoDB_ReplicaSet
+  - name: Add repository
+    yum_repository:
+      name: mongodb-org-3.4
+      description: Official MongoDB 3.4 yum repo
+      baseurl: https://repo.mongodb.org/yum/redhat/$releasever/mongodb-org/3.4/x86_64/
+      gpgcheck: 1
+      gpgkey: https://www.mongodb.org/static/pgp/server-3.4.asc
+
+  - name: Install MongoDB packages on the shard servers
+    yum:
+      name: ["mongodb-org-server",
+             "mongodb-org-shell",
+             "mongodb-org-tools"]
+      enablerepo: "mongodb-org-3.4"
+      state: "installed"
+
+  - name: Ensure epel is present
+    yum:
+      name: epel-release
+      state: installed
+
+  - name: Install additional packages
+    yum:
+      name: "{{ additional_packages }}"
+      state: installed
+
+  - name: Install additional python packages
+    pip:
+      name: "{{ additional_python_packages }}"
+      state: present
+
+  - name: Ensure files and directories are owned by mongod
+    file:
+      path: ["/var/log/mongodb/", "/var/lib/mongo", "/var/run/mongodb/mongod.pid"]
+      owner: "mongod"
+      group: "mongod"
+      recurse: "yes"
+
+  - name: Generate /etc/hosts file
+    template:
+      src: templates/hosts.j2
+      dest: /etc/hosts
+    when: ansible_managed_hosts_file == True
+
+  - name: Copy mongod config file to hosts
+    template:
+      src: templates/mongod.conf.j2
+      dest: /etc/mongod.conf
+      backup: yes
+      owner: mongod
+      group: mongod
+      mode: 0644
+
+  - name: Generate 8192 bit private key for x509
+    shell: "openssl genrsa -out {{ mongoCA_key_file }} -passout pass:{{ mongo_certificate_x509_passphrase }} -aes256 8192"
+    args:
+      creates: "{{ mongoCA_key_file }}"
+    register: mongoCA
+    run_once: true
+
+  - name: Sign a new CA certificate
+    shell: "openssl req -x509 -new -extensions v3_ca -key {{ mongoCA_key_file | quote }} -days {{ mongoCA_certificate_days }} -subj {{ mongoCA_openssl_subject_CA_cert | quote }} -passin pass:{{ mongo_certificate_x509_passphrase | quote }} -out mongoCA.crt"
+    when: mongoCA.changed == True
+    run_once: true
+
+  - name: Get certifcate generate CA certifcate & key from first host
+    fetch:
+      src: "/home/vagrant/{{ item }}"
+      dest: /tmp
+    with_items:
+      - mongoCA.crt
+      - mongoCA.key
+
+  - name: Copy certificate & key to other hosts
+    copy:
+      src: "/tmp/{{ play_hosts | first }}/home/vagrant/{{ item }}"
+      dest: /home/vagrant
+    with_items:
+      - mongoCA.crt
+      - mongoCA.key
+
+  - name: Delete local copy of file
+    local_action: file path="/tmp/{{ ansible_hostname }}" state=absent
+    run_once: true
+    become: false
+
+  - name: Step 1 - Issue Certificates for each of the MongoDB Instances
+    shell: "openssl req -new -nodes -newkey rsa:4096 -keyout $(hostname).key -out $(hostname).csr -subj {{ mongoCA_openssl_subject_host_cert | quote }}"
+    when: mongoCA.changed == True
+
+  - name: Step 2 - Issue Certificates for each of the MongoDB Instances
+    shell: "openssl x509 -CA /home/vagrant/mongoCA.crt -CAkey {{ mongoCA_key_file | quote }} -CAcreateserial  -req -days {{ mongoCA_certificate_days | int }} -in $(hostname).csr -passin pass:{{ mongo_certificate_x509_passphrase | quote }} -out $(hostname).crt"
+    when: mongoCA.changed == True
+
+  - name: Step 3 - Issue Certificates for each of the MongoDB Instances
+    shell: "cat $(hostname).key $(hostname).crt > $(hostname).pem"
+    when: mongoCA.changed == True
+
+  - name: Create folder for Certificates
+    file:
+      path: /etc/mongodb/ssl
+      state: directory
+      owner: mongod
+      group: mongod
+      mode: 0700
+
+  - name: Copy mongoCA.crt and $(hostname).pem to /etc/mongodb/ssl
+    copy:
+      src: "{{ item }}"
+      remote_src: true
+      dest: /etc/mongodb/ssl
+      owner: mongod
+      group: mongod
+      mode: 0700
+    with_items:
+      - /home/vagrant/mongoCA.crt
+      - "/home/vagrant/{{ ansible_hostname }}.pem"
+
+  - name: Ensure mongod service is running
+    service:
+      name: "mongod"
+      state: "started"
+      enabled: yes
+    register: mongo
+
+  - name: Give mongod daemon a little time
+    pause:
+      seconds: 30
+    when: mongo.changed == True
+
+  - name: Ensure replicaset exists
+    mongodb_replicaset:
+      login_user: "{{ mongodb_admin_user }}"
+      login_password: "{{ mongodb_admin_password }}"
+      login_host: "localhost"
+      login_database: "admin"
+      replica_set: "{{ mongodb_replicasets[ansible_hostname]['replicaset'] }}"
+      members: "{{ mongodb_replicasets[ansible_hostname]['members'] }}"
+    register: replset
+    when: ansible_hostname in ['mongod-node1','mongod-node4']
+
+  - name: Give mongo daemon a little time to elect a PRIMARY
+    pause:
+      seconds: 30
+
+  - name: Create MongoDB admin user on each node
+    mongodb_user:
+      login_host: localhost
+      login_database: admin
+      database: admin
+      name: "{{ mongodb_admin_user }}"
+      password: "{{ mongodb_admin_password }}"
+      roles: ["root"]
+    register: mongo_admin_user
+    ignore_errors: yes
+    failed_when:
+      - "mongo_admin_user.failed is defined"
+      - "mongo_admin_user.failed == True"
+      - "'not authorized on admin to execute command' not in mongo_admin_user.msg"
+
+  - name: Append x509 and repl stuff to mongod.conf
+    blockinfile:
+      path: /etc/mongod.conf
+      block: "{{ lookup('template', 'mongod_ssl_x509.conf.j2') }}"
+      insertafter: "^  port:"
+    register: mongod_conf
+
+  - name: Restart mongod
+    service:
+      name: mongod
+      state: restarted
+    when: mongod_conf.changed == True
+
+  - name: Create MongoDB application users on shard1
+    mongodb_user:
+      login_user: "{{ mongodb_admin_user }}"
+      login_password: "{{ mongodb_admin_password }}"
+      database: "{{ item['db'] }}"
+      name: "{{ item['name'] }}"
+      password: "{{ item['password'] }}"
+      roles: "{{ item['roles'] }}"
+      replica_set: "rs1"
+      state: present
+    with_items:
+      - "{{ mongodb_user_dict_list }}"
+    when: ansible_hostname == 'mongod-node1'
+    run_once: true
+
+  - name: Create MongoDB application users on shard2
+    mongodb_user:
+      login_user: "{{ mongodb_admin_user }}"
+      login_password: "{{ mongodb_admin_password }}"
+      database: "{{ item['db'] }}"
+      name: "{{ item['name'] }}"
+      password: "{{ item['password'] }}"
+      roles: "{{ item['roles'] }}"
+      replica_set: "rs2"
+      state: present
+    with_items:
+      - "{{ mongodb_user_dict_list }}"
+    when: ansible_hostname == 'mongod-node4'
+    run_once: true
+
+  - name: Setup shards
+    mongodb_shard:
+      login_user: "{{ mongodb_admin_user }}"
+      login_password: "{{ mongodb_admin_password }}"
+      shard: "{{ item }}"
+      state: present
+    with_items:
+      - { mongod-node1: "rs1/mongod-node1,mongod-node2,mongod-node3" }
+      - { mongod-node4: "rs2/mongod-node4,mongod-node5,mongod-node6" }
+    when: ansible_hostname in ['mongod-node1','mongod-node4']
