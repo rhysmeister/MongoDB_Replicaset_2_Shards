@@ -49,6 +49,9 @@ Vagrant.configure("2") do |config|
               "mongod-node5",
               "mongod-node6"
             ],
+            "mongos" => [
+              "mongos-node1"
+            ],
             "rs1:vars" => {"replicaset" => "rs1"},
             "rs2:vars" => {"replicaset" => "rs2"}
           }

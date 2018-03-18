@@ -16,6 +16,13 @@
       enablerepo: "mongodb-org-3.4"
       state: "installed"
 
+  - name: Install mongos on appropriate hosts
+    yum:
+      name: "mongodb-org-mongos"
+      enablerepo: "mongodb-org-3.4"
+      state: "installed"
+    when: 'mongos' in group_name
+
   - name: Ensure epel is present
     yum:
       name: epel-release
@@ -52,6 +59,7 @@
       owner: mongod
       group: mongod
       mode: 0644
+    when: 'mongod' in group_names
 
   - name: Generate 8192 bit private key for x509
     shell: "openssl genrsa -out {{ mongoCA_key_file }} -passout pass:{{ mongo_certificate_x509_passphrase }} -aes256 8192"
@@ -59,11 +67,13 @@
       creates: "{{ mongoCA_key_file }}"
     register: mongoCA
     run_once: true
+    when: 'mongod' in group_names
 
   - name: Sign a new CA certificate
     shell: "openssl req -x509 -new -extensions v3_ca -key {{ mongoCA_key_file | quote }} -days {{ mongoCA_certificate_days }} -subj {{ mongoCA_openssl_subject_CA_cert | quote }} -passin pass:{{ mongo_certificate_x509_passphrase | quote }} -out mongoCA.crt"
     when: mongoCA.changed == True
     run_once: true
+    when: 'mongod' in group_names
 
   - name: Get certifcate generate CA certifcate & key from first host
     fetch:
@@ -72,6 +82,7 @@
     with_items:
       - mongoCA.crt
       - mongoCA.key
+    when: 'mongod' in group_names
 
   - name: Copy certificate & key to other hosts
     copy:
@@ -80,23 +91,25 @@
     with_items:
       - mongoCA.crt
       - mongoCA.key
+    when: 'mongod' in group_names
 
   - name: Delete local copy of file
     local_action: file path="/tmp/{{ ansible_hostname }}" state=absent
     run_once: true
     become: false
+    when: 'mongod' in group_names
 
   - name: Step 1 - Issue Certificates for each of the MongoDB Instances
     shell: "openssl req -new -nodes -newkey rsa:4096 -keyout $(hostname).key -out $(hostname).csr -subj {{ mongoCA_openssl_subject_host_cert | quote }}"
-    when: mongoCA.changed == True
+    when: mongoCA.changed == True and'mongod' in group_names
 
   - name: Step 2 - Issue Certificates for each of the MongoDB Instances
     shell: "openssl x509 -CA /home/vagrant/mongoCA.crt -CAkey {{ mongoCA_key_file | quote }} -CAcreateserial  -req -days {{ mongoCA_certificate_days | int }} -in $(hostname).csr -passin pass:{{ mongo_certificate_x509_passphrase | quote }} -out $(hostname).crt"
-    when: mongoCA.changed == True
+    when: mongoCA.changed == True and 'mongod' in group_names
 
   - name: Step 3 - Issue Certificates for each of the MongoDB Instances
     shell: "cat $(hostname).key $(hostname).crt > $(hostname).pem"
-    when: mongoCA.changed == True
+    when: mongoCA.changed == True and 'mongod' in group_names
 
   - name: Create folder for Certificates
     file:
@@ -105,6 +118,7 @@
       owner: mongod
       group: mongod
       mode: 0700
+    when: 'mongod' in group_names
 
   - name: Copy mongoCA.crt and $(hostname).pem to /etc/mongodb/ssl
     copy:
@@ -117,6 +131,7 @@
     with_items:
       - /home/vagrant/mongoCA.crt
       - "/home/vagrant/{{ ansible_hostname }}.pem"
+    when: 'mongod' in group_names
 
   - name: Ensure mongod service is running
     service:
@@ -124,6 +139,7 @@
       state: "started"
       enabled: yes
     register: mongo
+    when: 'mongod' in group_names
 
   - name: Give mongod daemon a little time
     pause:
@@ -159,6 +175,7 @@
       - "mongo_admin_user.failed is defined"
       - "mongo_admin_user.failed == True"
       - "'not authorized on admin to execute command' not in mongo_admin_user.msg"
+    when: 'mongod' in group_names
 
   - name: Append x509 and repl stuff to mongod.conf
     blockinfile:
@@ -166,12 +183,13 @@
       block: "{{ lookup('template', 'mongod_ssl_x509.conf.j2') }}"
       insertafter: "^  port:"
     register: mongod_conf
+    when: 'mongod' in group_names
 
   - name: Restart mongod
     service:
       name: mongod
       state: restarted
-    when: mongod_conf.changed == True
+    when: mongod_conf.changed == True and 'mongod' in group_names
 
   - name: Create MongoDB application users on shard1
     mongodb_user:
