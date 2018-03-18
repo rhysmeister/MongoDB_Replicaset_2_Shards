@@ -10,11 +10,6 @@ Vagrant.configure("2") do |config|
         vbox.linked_clone = true
         vbox.name = node_name
       end
-      if mongos == MONGOS_HOSTS
-        mongos_node.vm.provision :ansible do |ansible|
-        ansible.limit = "all" # Connect to all machines
-        ansible.playbook = "mongos.yaml"
-      end
     end
   end
   MONGOD_HOSTS=6
@@ -61,5 +56,4 @@ Vagrant.configure("2") do |config|
       end
     end
   end
-end
 end
